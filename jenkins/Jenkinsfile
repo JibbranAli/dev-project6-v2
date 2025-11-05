@@ -1,0 +1,205 @@
+pipeline {
+    agent any
+    
+    environment {
+        IMAGE_NAME = 'devops-flask-app'
+        KUBECONFIG = credentials('kubeconfig')
+        TRIVY_CACHE_DIR = '/tmp/trivy-cache'
+        BUILD_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.BUILD_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r app/requirements.txt
+                '''
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    cd app
+                    python -m pytest ../tests/ -v --junitxml=../reports/test-results.xml
+                '''
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'reports/test-results.xml'
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_TAG = "${IMAGE_NAME}:${BUILD_TAG}"
+                    sh "docker build -f docker/Dockerfile -t ${IMAGE_TAG} ."
+                    sh "docker tag ${IMAGE_TAG} ${IMAGE_NAME}:latest"
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                sh '''
+                    # Create reports directory
+                    mkdir -p reports/security
+                    
+                    # Scan Docker image with Trivy
+                    trivy image --format json --output reports/security/trivy-report.json ${IMAGE_TAG} || true
+                    
+                    # Generate human-readable report
+                    trivy image --format table --output reports/security/trivy-summary.txt ${IMAGE_TAG} || true
+                    
+                    # Check for HIGH and CRITICAL vulnerabilities (non-blocking for demo)
+                    trivy image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_TAG} || echo "Security scan completed with warnings"
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/security/*', fingerprint: true, allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('Load Image to Kind') {
+            steps {
+                script {
+                    // Load image into kind cluster for local deployment
+                    sh "kind load docker-image ${IMAGE_TAG} --name devops-cluster"
+                    sh "kind load docker-image ${IMAGE_NAME}:latest --name devops-cluster"
+                }
+            }
+        }
+        
+        stage('Update Kubernetes Manifests') {
+            steps {
+                script {
+                    def environment = env.BRANCH_NAME == 'main' ? 'prod' : 'dev'
+                    
+                    sh """
+                        # Update Kubernetes manifests with new image tag
+                        sed -i 's|image: ${IMAGE_NAME}:.*|image: ${IMAGE_TAG}|g' k8s/${environment}/deployment.yaml
+                        
+                        # Ensure imagePullPolicy is set to Never for local images
+                        if ! grep -q "imagePullPolicy: Never" k8s/${environment}/deployment.yaml; then
+                            sed -i '/image: ${IMAGE_NAME}:/a\\        imagePullPolicy: Never' k8s/${environment}/deployment.yaml
+                        fi
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Development') {
+            steps {
+                sh '''
+                    # Apply Kubernetes manifests
+                    kubectl apply -f k8s/dev/
+                    
+                    # Wait for deployment to be ready
+                    kubectl rollout status deployment/flask-app -n dev --timeout=300s
+                    
+                    # Verify pods are running
+                    kubectl get pods -n dev -l app=flask-app
+                '''
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    input message: 'Deploy to Production?', ok: 'Deploy'
+                }
+                sh '''
+                    # Apply production manifests
+                    kubectl apply -f k8s/prod/
+                    
+                    # Wait for deployment to be ready
+                    kubectl rollout status deployment/flask-app -n prod --timeout=300s
+                    
+                    # Verify pods are running
+                    kubectl get pods -n prod -l app=flask-app
+                '''
+            }
+        }
+        
+        stage('Post-Deployment Tests') {
+            parallel {
+                stage('Health Check') {
+                    steps {
+                        script {
+                            def environment = env.BRANCH_NAME == 'main' ? 'prod' : 'dev'
+                            sh """
+                                # Wait for pods to be ready
+                                sleep 30
+                                
+                                # Test health endpoint via port-forward
+                                kubectl port-forward svc/flask-app-service 8080:80 -n ${environment} &
+                                PF_PID=\$!
+                                sleep 10
+                                
+                                # Health check
+                                curl -f http://localhost:8080/health || echo "Health check failed"
+                                curl -f http://localhost:8080/api/users || echo "API test failed"
+                                
+                                # Cleanup port-forward
+                                kill \$PF_PID 2>/dev/null || true
+                            """
+                        }
+                    }
+                }
+                
+                stage('Deployment Verification') {
+                    steps {
+                        script {
+                            def environment = env.BRANCH_NAME == 'main' ? 'prod' : 'dev'
+                            sh """
+                                # Verify deployment status
+                                kubectl get deployment flask-app -n ${environment}
+                                kubectl get pods -n ${environment} -l app=flask-app
+                                kubectl get svc -n ${environment}
+                                
+                                # Check logs for any errors
+                                kubectl logs deployment/flask-app -n ${environment} --tail=20 || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+            // Add notification logic here
+        }
+    }
+}
